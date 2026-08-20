@@ -1,0 +1,22 @@
+# dsh-cybernetics bundle patch — 控制论内核 v4 运行时
+# 挂载：把 dsh-cybernetics 加入 profile 的 dsh.profile.bundles
+- insert:
+    - id: cybernetics
+      name: 'dsh-cybernetics'
+      config:
+        stateLog: '~/.dsh/cybernetics/state_log.ndjson'
+        feedforward:
+          - id: 'network-unstable'
+            tools: ['bash']
+            pattern: '\\b(git|npm|curl|wget|pnpm)\\b'
+            action: { strategy: 'retry+timeout', retry: 2, timeout: 30000 }
+          - id: 'irreversible-write'
+            tools: ['bash']
+            pattern: '\\b(rm|mv|rmdir|shred)\\b|git (push|reset --hard|clean)'
+            action: { strategy: 'dry-run+confirm', dryRun: true, confirm: true }
+        stability:
+          maxToolCallsPerTurn: 5
+        modes:
+          fast: { label: '快速响应', zeta: 0.3 }
+          deep: { label: '深度分析', zeta: 0.7 }
+          conservative: { label: '保守稳定', zeta: 1.2 }
