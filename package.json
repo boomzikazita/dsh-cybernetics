@@ -1,24 +1,11 @@
 {
   "name": "dsh-cybernetics",
+  "private": true,
   "version": "0.1.0",
   "type": "module",
   "main": "index.js",
-  "license": "MIT",
-  "author": "boomzikazita",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/boomzikazita/dsh-cybernetics.git"
-  },
-  "keywords": [
-    "dsh",
-    "dsh-plugin",
-    "deepseek-harness",
-    "cybernetics",
-    "control-theory",
-    "self-adaptive"
-  ],
-  "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6"
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6"
   },
   "dsh": {
     "bundle": {
