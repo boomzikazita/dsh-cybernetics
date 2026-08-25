@@ -122,6 +122,7 @@ function createSessionState(sid, seed = {}) {
     sessionObserved: new Set(), // 本次会话实际调用过的工具（能观性分层依据）
     lastStartTs: 0,            // B5 最近一次 pre-execute 起点
     lastStartTool: '',
+    failedHintSent: false,     // 连续失败→skill_search 兜底提示已注入标记（每轮重置）
   }
 }
 
@@ -401,7 +402,10 @@ export function apply(ctx, config = {}) {
     s.entropy = computeEntropyPure(s.recentCalls)
 
     // B4 熵告警（低熵 = 工具单一化 → 可能死循环/偏执；带滞环防抖）
-    if (s.recentCalls.length >= 8 && s.entropy < cfg.control.entropyWarnAt && !s.entropyWarned) {
+    // 2026-08-23 豁免：automation/lark 固定流程会话天然单工具，低熵是正常行为非偏执
+    // （周检实测：48 次 entropy-warn 中 automation 9 + lark 7 = 16 次确定性误报，占 1/3）
+    const entropyExempt = /^(dsh-automation|automation|lark)/.test(sid)
+    if (!entropyExempt && s.recentCalls.length >= 8 && s.entropy < cfg.control.entropyWarnAt && !s.entropyWarned) {
       s.entropyWarned = true
       logState({ ts: now, event: 'entropy-warn', sid, entropy: s.entropy, window: s.recentCalls.length })
       queueWarn(s, `[控制律] 工具分布熵 ${s.entropy.toFixed(2)} 过低（<${cfg.control.entropyWarnAt}，最近 ${s.recentCalls.length} 次调用工具单一化），疑似陷入循环/偏执，请检查当前策略并多样化工具使用`)
@@ -522,6 +526,24 @@ export function apply(ctx, config = {}) {
       }
     }
     if (dtMs != null) entry.dtMs = dtMs
+
+    // ---------- 连续失败 → skill_search 兜底（2026-08-24 能控性补全） ----------
+    // 场景：模型遇到「读图/OCR/转换」等任务时用底层工具反复试错、连续失败，
+    //       却跳过技能库检索。此处复用 divergenceStreak（delta===1 递增、成功清零）
+    //       作为连续失败计数，达到阈值即注入强制提示，点名 skill_search 工具，
+    //       把「遇阻先查技能库」从模型自觉变成程序前馈（不依赖记性）。
+    // 豁免：skill_search / skill_mece_check / skill 本身——避免「检索失败→再提示检索」死循环。
+    const SKILL_DISCOVERY_TOOLS = new Set(['skill_search', 'skill_mece_check', 'skill', 'list_agents'])
+    if (isError && !SKILL_DISCOVERY_TOOLS.has(tool) && s.divergenceStreak >= 2 && !s.failedHintSent) {
+      s.failedHintSent = true
+      const lastArgs = execArgsText(exec) || ''
+      const ctxHint = lastArgs ? `（最近失败调用：\`${tool}\` ${lastArgs.slice(0, 120)}）` : ''
+      logState({ ts: Date.now(), event: 'skill-search-fallback', sid, tool, streak: s.divergenceStreak })
+      queueWarn(s, `[能控性兜底] 连续 ${s.divergenceStreak} 次工具调用失败，疑似在用底层工具硬解、而非检索既有能力。` +
+        `请立即调用 \`skill_search\` 工具检索「${tool}」相关关键词，确认是否有对口技能/现成脚本（如 OCR、读图、转换类），` +
+        `再决定下一步；禁止在未检索技能库的情况下判定任务不可行。${ctxHint}`)
+    }
+
     logState(entry)
   })
 
@@ -535,6 +557,7 @@ export function apply(ctx, config = {}) {
         const sid = payload?.agent?.session?.id ?? 'global'
         const s = getSessionState(sid)
         s.toolCallsInTurn = 0 // 本轮计数重置（每轮请求边界）
+        s.failedHintSent = false // 连续失败兜底提示每轮允许重新触发
         if (s.pendingWarns.length === 0) return decision
         const warns = s.pendingWarns
         s.pendingWarns = []
