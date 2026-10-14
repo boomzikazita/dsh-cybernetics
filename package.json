@@ -1,11 +1,22 @@
 {
   "name": "dsh-cybernetics",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "index.js",
-  "dependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.0-rc.6"
+  "description": "控制论内核 v4 运行时：EMA 反馈回路/发散振荡检测/能控性自检/稳定阀。v0.2.0：适配 dsh 0.2（Config 不导出、pre-step 注入 v4 source 形态）；不可逆拦截规则收敛至 dsh-approval-gate，feedforward 仅保留 retry/timeout 放行+警告。",
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
   },
   "dsh": {
     "bundle": {

@@ -11,6 +11,7 @@ import {
   MODE_ORDER,
   MODE_LIMITS,
   ema,
+  adaptiveAlpha,
   detectOscillationPure,
   adjustControlPure,
   execArgsText,
@@ -40,17 +41,44 @@ test('振荡检测：高频翻转判振荡，稳定成功/稳定失败不判', (
   assert.equal(detectOscillationPure([1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 0.7), false, '稳定失败（发散而非振荡）')
 })
 
-test('滞环：pHat 高升档（fast→deep→conservative，顶档不再升）', () => {
-  const control = { escalateAt: 0.6, deescalateAt: 0.15, deescalateStreak: 5 }
-  let r = adjustControlPure({ pHat: 0.8, autoMode: 'fast', deescalateStreak: 0, control })
+test('v4.3 升档对称防抖：pHat 高需连续 3 次才升档，单次不升', () => {
+  const control = { escalateAt: 0.6, deescalateAt: 0.15, deescalateStreak: 5, escalateStreak: 3, divergenceStreak: 3 }
+  let r = adjustControlPure({ pHat: 0.8, autoMode: 'fast', deescalateStreak: 0, escalateStreak: 0, divergenceStreak: 0, control })
+  assert.equal(r.escalated, false, '单次超阈值不升（防抖）')
+  assert.equal(r.escalateStreak, 1)
+  r = adjustControlPure({ pHat: 0.8, autoMode: 'fast', deescalateStreak: 0, escalateStreak: r.escalateStreak, divergenceStreak: 0, control })
+  assert.equal(r.escalated, false, '第 2 次仍不升')
+  assert.equal(r.escalateStreak, 2)
+  r = adjustControlPure({ pHat: 0.8, autoMode: 'fast', deescalateStreak: 0, escalateStreak: r.escalateStreak, divergenceStreak: 0, control })
+  assert.equal(r.escalated, true, '第 3 次升档')
   assert.equal(r.autoMode, 'deep')
-  assert.equal(r.escalated, true)
-  assert.equal(r.deescalateStreak, 0, '升档后防抖计数清零')
-  r = adjustControlPure({ pHat: 0.8, autoMode: 'deep', deescalateStreak: 0, control })
-  assert.equal(r.autoMode, 'conservative')
-  r = adjustControlPure({ pHat: 0.9, autoMode: 'conservative', deescalateStreak: 0, control })
-  assert.equal(r.autoMode, 'conservative', '顶档不升')
-  assert.equal(r.escalated, false)
+  assert.equal(r.escalateStreak, 0, '升档后防抖清零')
+  // 顶档不再升
+  const top = adjustControlPure({ pHat: 0.9, autoMode: 'conservative', deescalateStreak: 0, escalateStreak: 3, divergenceStreak: 0, control })
+  assert.equal(top.autoMode, 'conservative', '顶档不升')
+  assert.equal(top.escalated, false)
+})
+
+test('v4.3 发散直通升档：连续失败不依赖 pHat 立即升档（修复 0.488 卡档）', () => {
+  const control = { escalateAt: 0.6, deescalateAt: 0.15, deescalateStreak: 5, escalateStreak: 3, divergenceStreak: 3 }
+  // 关键场景：pHat=0.488（连续 3 次失败的 EMA 稳态值）< escalateAt=0.6，但 divergenceStreak=3 → 直通升档
+  const r = adjustControlPure({ pHat: 0.488, autoMode: 'fast', deescalateStreak: 0, escalateStreak: 0, divergenceStreak: 3, control })
+  assert.equal(r.escalated, true, '发散直通升档，不依赖 pHat 越过 0.6')
+  assert.equal(r.autoMode, 'deep')
+  // 发散升档也清零降档防抖（方向一致）
+  assert.equal(r.deescalateStreak, 0)
+  // 顶档发散不再升（饱和兜底在 index.js 层处理）
+  const top = adjustControlPure({ pHat: 0.488, autoMode: 'conservative', deescalateStreak: 0, escalateStreak: 0, divergenceStreak: 6, control })
+  assert.equal(top.escalated, false)
+  assert.equal(top.autoMode, 'conservative')
+})
+
+test('v4.3 自适应增益：连续失败用大 α 快速响应，稳态用小 α 抗抖动', () => {
+  const ctrl = { alphaLow: 0.15, alphaHigh: 0.5, divergenceStreak: 2 }
+  assert.equal(adaptiveAlpha(0, ctrl), 0.15)
+  assert.equal(adaptiveAlpha(1, ctrl), 0.15, '1 次失败仍稳态')
+  assert.equal(adaptiveAlpha(2, ctrl), 0.5, '连续 2 次失败转大增益')
+  assert.equal(adaptiveAlpha(5, ctrl), 0.5)
 })
 
 test('滞环：降档需连续 5 次低失败率（防抖），中途反弹清零', () => {

@@ -5,13 +5,18 @@
  * 也可被其他工具（周检 automation、observer 脚本）复用。
  * 控制回路的数据结构/副作用（state、hooks、日志）留在 index.js。
  *
+ * v0.2.0（2026-10-14，规则收敛）：
+ *   DEFAULT_FEEDFORWARD 清空——irreversible-write 等不可逆拦截规则移交
+ *   dsh-approval-gate（rules.json 内置 deny 段），cybernetics 不再持有拦截类规则；
+ *   retry/timeout 类「放行+警告」规则由 cordis.patch.yml 的 feedforward 配置按需下发。
+ *
  * v4.2（2026-08-19）：
  *   A1 冗余 hash 改用参数文本（exec.arguments），修复 rc.6 下 exec.args 恒 undefined
  *      导致的同工具全判"同参数重复"假冗余。
  *   C13 健康评分、B4 熵阈值等纯逻辑下沉到此处。
  */
 
-export const VERSION = 'v4.2'
+export const VERSION = 'v4.4'
 
 // 档位 → 阻尼系数 zeta（速度-稳定权衡；保留默认，patch 可覆盖）
 export const DEFAULT_MODES = { fast: 0.3, deep: 0.7, conservative: 1.2 }
@@ -22,20 +27,11 @@ export const MODE_ORDER = ['fast', 'deep', 'conservative']
 export const MODE_LIMITS = { fast: 5, deep: 4, conservative: 3 }
 
 export const DEFAULT_FEEDFORWARD = [
-  // network-unstable（git/npm/curl/wget/pnpm 拦截）已于 2026-08-18 移除：
-  // 每次网络命令都被 block 太烦，且 retry+timeout 提示对模型是干扰而非帮助；
-  // 需要时可在 cordis.patch.yml 的 feedforward 配置里按需加回
-  // 2026-08-20 周检扰动入库（插件加载失败 → systemd 重启风暴，08-18/19 共 3718 次 boot）：
-  // 该扰动不走工具拦截（是启动期事件非工具调用），落地为 dsh-web.service ExecStartPre
-  // 启动前自检（~/.dsh/scripts/dsh_prestart_check.sh：node --check 插件语法 + 顶层依赖完整性），
-  // 把"启动即崩溃"转为"启动前发现"；观测信号：journal 含 SyntaxError / ERR_MODULE_NOT_FOUND /
-  // JsonSchemaError: additionalProperties（spec-gate 已于 08-19 显式化修复）
-  {
-    id: 'irreversible-write',
-    tools: ['bash'],
-    pattern: '\\b(rm|mv|rmdir|shred)\\b|git (push|reset --hard|clean)',
-    action: { strategy: 'dry-run+confirm', dryRun: true, confirm: true },
-  },
+  // v0.2.0（2026-10-14 规则收敛）：irreversible-write 拦截规则移交 dsh-approval-gate，
+  // 本表默认清空；retry/timeout 类「放行+警告」规则由 cordis.patch.yml 按需配置。
+  // 更早历史：network-unstable（git/npm/curl/wget/pnpm 拦截）已于 2026-08-18 移除；
+  // 2026-08-20 周检扰动入库（插件加载失败 → systemd 重启风暴）落地为 dsh-web.service
+  // ExecStartPre 启动前自检（~/.dsh/scripts/dsh_prestart_check.sh）。
 ]
 
 /**
@@ -44,6 +40,16 @@ export const DEFAULT_FEEDFORWARD = [
  */
 export function ema(prev, delta, alpha = 0.2) {
   return (1 - alpha) * prev + alpha * delta
+}
+
+/**
+ * 自适应增益（v4.3，对照 15.11 卡尔曼自适应增益的工程简化）：
+ * 固定 α 的缺陷——α 小（滤波强）则失败率突变时响应慢，α 大则偶发失败抖动。
+ * 解法：连续失败（divergenceStreak ≥ 阈值）时用大 α 快速跟上现实，否则用小 α 强滤波抗抖动。
+ * 返回当前应使用的滤波系数 α。
+ */
+export function adaptiveAlpha(divergenceStreak, { alphaLow = 0.15, alphaHigh = 0.5, divergenceStreak: divReq = 2 } = {}) {
+  return divergenceStreak >= divReq ? alphaHigh : alphaLow
 }
 
 /**
@@ -60,33 +66,58 @@ export function detectOscillationPure(buf, ratio = 0.7) {
 }
 
 /**
- * 滞环控制律（纯，P0-1 负反馈 + 滞环防抖）：
- * 输入当前 pHat/档位/防抖计数 → 输出目标档位与迁移标记。不产生副作用，
+ * 滞环控制律（纯，P0-1 负反馈 + 滞环防抖；v4.3 发散直通升档 + 升档对称防抖）：
+ * 输入当前 pHat/档位/降档防抖/升档防抖/发散计数 → 输出目标档位与迁移标记。不产生副作用，
  * 是否写日志/发警告由调用方决定。
  *
- * 返回 { autoMode, deescalateStreak, escalated, deescalated }
+ * v4.3 修订（对照实测）：
+ *  - 发散（连续失败 divergenceStreak ≥ 阈值）是强信号，直接升档，不依赖 pHat——
+ *    修复"连续失败告警了但 pHat 卡在 0.488 推不动档位"的解耦缺陷。
+ *  - 升档加对称防抖（escalateStreak ≥ 阈值才升）——修复"突发失败→瞬间升到顶→快速降回"的档位抖动。
+ *
+ * 返回 { autoMode, deescalateStreak, escalateStreak, escalated, deescalated }
  */
-export function adjustControlPure({ pHat, autoMode, deescalateStreak, control }) {
-  const { escalateAt = 0.6, deescalateAt = 0.15, deescalateStreak: streakReq = 5 } = control
+export function adjustControlPure({ pHat, autoMode, deescalateStreak = 0, escalateStreak = 0, divergenceStreak = 0, control }) {
+  const {
+    escalateAt = 0.6,
+    deescalateAt = 0.15,
+    deescalateStreak: dsReq = 5,
+    escalateStreak: esReq = 3,
+    divergenceStreak: divReq = 3,
+  } = control
   let next = autoMode
-  let newStreak = deescalateStreak
+  let newDs = deescalateStreak
+  let newEs = escalateStreak
   let escalated = false
   let deescalated = false
-  if (pHat >= escalateAt && autoMode !== 'conservative') {
-    next = MODE_ORDER[Math.min(MODE_ORDER.indexOf(autoMode) + 1, MODE_ORDER.length - 1)]
-    escalated = true
-    newStreak = 0
-  } else if (pHat <= deescalateAt && autoMode !== 'fast') {
-    newStreak += 1
-    if (newStreak >= streakReq) {
+
+  const divergent = divergenceStreak >= divReq // 发散：连续失败，强信号
+  const phHigh = pHat >= escalateAt            // 失败率高
+  const phLow = pHat <= deescalateAt           // 失败率低
+
+  if (autoMode !== 'conservative' && (divergent || phHigh)) {
+    newDs = 0
+    // 发散直接升档（连续失败 divReq 次本身即是防抖）；pHat 高需连续 esReq 次防抖
+    if (divergent || newEs + 1 >= esReq) {
+      next = MODE_ORDER[Math.min(MODE_ORDER.indexOf(autoMode) + 1, MODE_ORDER.length - 1)]
+      escalated = true
+      newEs = 0
+    } else {
+      newEs += 1
+    }
+  } else if (autoMode !== 'fast' && phLow) {
+    newEs = 0
+    newDs += 1
+    if (newDs >= dsReq) {
       next = MODE_ORDER[Math.max(MODE_ORDER.indexOf(autoMode) - 1, 0)]
       deescalated = true
-      newStreak = 0
+      newDs = 0
     }
   } else {
-    newStreak = 0
+    newEs = 0
+    newDs = 0
   }
-  return { autoMode: next, deescalateStreak: newStreak, escalated, deescalated }
+  return { autoMode: next, deescalateStreak: newDs, escalateStreak: newEs, escalated, deescalated }
 }
 
 /** 参数文本提取（A1）：rc.6 参数字段为 arguments，兼容旧字段名 args 兜底 */

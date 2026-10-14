@@ -1,6 +1,24 @@
 /**
  * dsh-cybernetics — 控制论内核 v4 运行时（DeepSeek Harness 插件）
  *
+ * v0.2.0（2026-10-14，dsh 0.2 适配 + 规则收敛）：
+ *   适配 1 删除 `export const Config = null`（Config 不导出才安全，null 会崩设置页）
+ *   适配 2 feedforward 规则表删除不可逆写入类（irreversible-write 等）拦截规则——
+ *      「批不批」收敛到 dsh-approval-gate；本插件只保留 retry/timeout 类「放行+警告」
+ *   适配 3 agent/pre-step 注入 source 改 v4 形态 { kind: 'plugin:dsh-cybernetics' }
+ *      （旧 { kind:'plugin', plugin:... } 形态被 0.2 v4 校验器直接拒绝）
+ *
+ * v4.3（2026-08-25，对照《工程控制论》精读 + state_log 实测，5 项修正）：
+ *   D1 发散直通升档：连续失败（divergenceStreak≥阈值）直接升档，不再依赖 pHat——
+ *      修复"发散告警 7 次但 pHat 卡 0.488 推不动档位"的解耦缺陷（core.adjustControlPure）
+ *   D2 升档对称防抖：pHat 升档需连续 escalateStreak 次防抖，与降档对称——
+ *      修复"突发失败→瞬间升到顶→快速降回"的档位抖动
+ *   D3 自适应增益：连续失败时大 α（alphaHigh）快速跟上现实，稳态小 α（alphaLow）强滤波抗抖动
+ *      （core.adaptiveAlpha，对照 15.11 卡尔曼自适应增益的工程简化）
+ *   D4 保守档饱和兜底：conservative 下仍连续失败（≥saturationStreak）→ 注入"求助/人工介入"提示
+ *   D5 熵告警豁免 subagent（UUID sid）——专注型批量任务工具单一化是正常行为；FS_NOT_OBSERVED
+ *      失败兜底提示"先 read 再写"；异步 job pre/result 按 exec.__cyber 快照配对（修耗时/预测错位）
+ *
  * v4.2（2026-08-19，13 项完善，对照 v4.1 实测反馈）：
  *   A1 修复冗余 hash 假误报（exec.args 恒 undefined → 改用 execArgsText 参数文本）
  *   A2 观测完整率钳制 ≤1（孤儿 result 不再把分子顶破）
@@ -27,7 +45,8 @@
  *
  * 结构（经典控制回路）：
  *   观测器    内存状态（按 session 分区）+ JSONL 持久化（stateLog）
- *   前馈控制  tools/pre-execute：规则表拦截 + 本轮调用计数
+ *   前馈控制  tools/pre-execute：规则表「放行+警告」（retry/timeout 类；
+ *             不可逆拦截规则已收敛到 dsh-approval-gate）+ 本轮调用计数
  *   反馈校正  tools/result：delta → EMA → 控制律（档位自适应 + 发散/振荡检测）
  *   执行器    cybernetics_snap / cybernetics_status / cybernetics_check
  *             / cybernetics_sandbox_mode
@@ -44,6 +63,7 @@ import {
   MODE_LIMITS,
   DEFAULT_FEEDFORWARD,
   ema,
+  adaptiveAlpha,
   detectOscillationPure,
   adjustControlPure,
   execArgsText,
@@ -55,8 +75,6 @@ import {
 
 export const name = 'dsh-cybernetics'
 export const inject = ['tools', 'agents']
-
-export const Config = null
 
 // ---------- 规则归一化 ----------
 // 兼容两种配置来源：
@@ -100,12 +118,14 @@ function createSessionState(sid, seed = {}) {
     autoMode: seed.autoMode ?? 'fast', // 自适应档位（控制律输出）
     lastModeSwitch: 0,
     deescalateStreak: 0,
+    escalateStreak: 0,        // 升档防抖计数（v4.3 对称防抖）
     yPred: null,
     pHat: seed.pHat ?? 0,      // EMA 失败率估计（P1-1）
     startPHat: seed.pHat ?? 0, // B6 会话汇总用：起始失败率
     divergence: false,         // 发散标志（P1-2）
     divergenceStreak: 0,
     divergenceWarned: false,
+    saturationWarned: false,   // v4.3 保守档饱和求助防抖
     oscillation: false,        // 振荡标志（P1-2）
     oscillationWarned: false,
     resultBuf: [],             // delta 环形缓冲（振荡检测）
@@ -143,11 +163,15 @@ export function apply(ctx, config = {}) {
     stability: { maxToolCallsPerTurn: config.stability?.maxToolCallsPerTurn ?? 5 },
     modes: normalizeModes(config.modes),
     control: {
-      alpha: config.control?.alpha ?? 0.2,             // EMA 滤波系数
+      alpha: config.control?.alpha ?? 0.2,             // EMA 滤波系数（旧；被 alphaLow/alphaHigh 取代，兼容保留）
+      alphaLow: config.control?.alphaLow ?? config.control?.alpha ?? 0.15, // v4.3 稳态小增益（强滤波抗抖动）
+      alphaHigh: config.control?.alphaHigh ?? 0.5,     // v4.3 突变大增益（连续失败时快速跟上现实）
       escalateAt: config.control?.escalateAt ?? 0.6,   // 升档阈值（失败率高）
       deescalateAt: config.control?.deescalateAt ?? 0.15, // 降档阈值（失败率低）
       deescalateStreak: config.control?.deescalateStreak ?? 5, // 降档防抖连续次数（滞环）
+      escalateStreak: config.control?.escalateStreak ?? 3,     // v4.3 升档防抖连续次数（对称滞环）
       divergenceStreak: config.control?.divergenceStreak ?? 3, // 连续失败判定发散
+      saturationStreak: config.control?.saturationStreak ?? 6, // v4.3 保守档饱和求助阈值
       oscillationWindow: config.control?.oscillationWindow ?? 10, // 振荡检测窗口
       oscillationRatio: config.control?.oscillationRatio ?? 0.7,  // 翻转率阈值
       redundantWindow: config.control?.redundantWindow ?? 20,     // 冗余/熵窗口
@@ -231,8 +255,10 @@ export function apply(ctx, config = {}) {
     return s.mode
   }
   function adjustControl(s, delta) {
+    // v4.3 自适应增益：连续失败时大 α 快速跟上现实，稳态小 α 强滤波抗抖动（对照 15.11）
+    const alpha = adaptiveAlpha(s.divergenceStreak, cfg.control)
     // P1-1 一阶递归滤波：pHat = (1-α)·pHat + α·delta
-    s.pHat = ema(s.pHat, delta, cfg.control.alpha)
+    s.pHat = ema(s.pHat, delta, alpha)
     // 发散检测：连续失败（正反馈发散倾向）
     s.divergenceStreak = delta === 1 ? s.divergenceStreak + 1 : 0
     if (s.divergenceStreak >= cfg.control.divergenceStreak && !s.divergence) {
@@ -260,11 +286,13 @@ export function apply(ctx, config = {}) {
       s.oscillation = false
       s.oscillationWarned = false
     }
-    // 负反馈 + 滞环（防档位抖动）：纯函数决策，副作用（日志/警告）在此呈现
+    // 负反馈 + 滞环 + 发散直通升档（v4.3）：纯函数决策，副作用（日志/警告）在此呈现
     const r = adjustControlPure({
       pHat: s.pHat,
       autoMode: s.autoMode,
       deescalateStreak: s.deescalateStreak,
+      escalateStreak: s.escalateStreak,
+      divergenceStreak: s.divergenceStreak,
       control: cfg.control,
     })
     if (r.escalated || r.deescalated) {
@@ -272,10 +300,22 @@ export function apply(ctx, config = {}) {
       s.autoMode = r.autoMode
       if (s.modeSource !== 'manual') s.mode = r.autoMode
       s.lastModeSwitch = Date.now()
-      logState({ ts: Date.now(), event: 'mode-switch', sid: s.sid, from: prev, to: r.autoMode, pHat: s.pHat, cause: r.escalated ? 'escalate' : 'deescalate' })
-      queueWarn(s, `[控制律] 失败率 pHat=${s.pHat.toFixed(2)} ${r.escalated ? `超过阈值 ${cfg.control.escalateAt}` : `连续 ${cfg.control.deescalateStreak} 次低于阈值 ${cfg.control.deescalateAt}`}，模式档位 ${prev}→${r.autoMode}（稳定阀阈值 ${MODE_LIMITS[prev]}→${MODE_LIMITS[r.autoMode]}）`)
+      const cause = r.escalated ? (s.divergence ? 'escalate-divergence' : 'escalate') : 'deescalate'
+      logState({ ts: Date.now(), event: 'mode-switch', sid: s.sid, from: prev, to: r.autoMode, pHat: s.pHat, cause })
+      const reason = r.escalated
+        ? (s.divergence ? `连续 ${s.divergenceStreak} 次失败（发散直通升档）` : `失败率 pHat=${s.pHat.toFixed(2)} 连续超阈值 ${cfg.control.escalateAt}`)
+        : `失败率 pHat=${s.pHat.toFixed(2)} 连续 ${cfg.control.deescalateStreak} 次低于阈值 ${cfg.control.deescalateAt}`
+      queueWarn(s, `[控制律] ${reason}，模式档位 ${prev}→${r.autoMode}（稳定阀阈值 ${MODE_LIMITS[prev]}→${MODE_LIMITS[r.autoMode]}）`)
     }
     s.deescalateStreak = r.deescalateStreak
+    s.escalateStreak = r.escalateStreak
+    // v4.3 饱和兜底：保守档仍连续失败（超 saturationStreak）→ 求助而非硬试（控制饱和，对照第 4 章反例）
+    if (s.autoMode === 'conservative' && s.divergenceStreak >= cfg.control.saturationStreak && !s.saturationWarned) {
+      s.saturationWarned = true
+      logState({ ts: Date.now(), event: 'saturation-warn', sid: s.sid, streak: s.divergenceStreak, pHat: s.pHat })
+      queueWarn(s, `[控制律] 保守档下仍连续 ${s.divergenceStreak} 次失败（饱和），继续硬试无益，建议暂停并求助用户或人工介入，不要继续盲目重试`)
+    }
+    if (delta === 0) s.saturationWarned = false // 成功后复位，允许下次饱和再告警
   }
 
   // ---------- A3 日志回放恢复（boot 时调用）：pHat/档位跨重启续算 ----------
@@ -286,18 +326,23 @@ export function apply(ctx, config = {}) {
       let p = 0
       let autoMode = 'fast'
       let deescalateStreak = 0
+      let escalateStreak = 0
+      let divergenceStreak = 0
       let results = 0
       let lastResultTs = 0
       for (const l of lines) {
         let e
         try { e = JSON.parse(l) } catch { continue }
         if (e.event === 'result' && typeof e.delta === 'number') {
-          p = ema(p, e.delta, cfg.control.alpha)
+          divergenceStreak = e.delta === 1 ? divergenceStreak + 1 : 0
+          const alpha = adaptiveAlpha(divergenceStreak, cfg.control)
+          p = ema(p, e.delta, alpha)
           lastResultTs = e.ts ?? 0
           results += 1
-          const r = adjustControlPure({ pHat: p, autoMode, deescalateStreak, control: cfg.control })
+          const r = adjustControlPure({ pHat: p, autoMode, deescalateStreak, escalateStreak, divergenceStreak, control: cfg.control })
           autoMode = r.autoMode
           deescalateStreak = r.deescalateStreak
+          escalateStreak = r.escalateStreak
         } else if (e.event === 'mode-switch' && typeof e.to === 'string') {
           autoMode = e.to
         }
@@ -404,7 +449,11 @@ export function apply(ctx, config = {}) {
     // B4 熵告警（低熵 = 工具单一化 → 可能死循环/偏执；带滞环防抖）
     // 2026-08-23 豁免：automation/lark 固定流程会话天然单工具，低熵是正常行为非偏执
     // （周检实测：48 次 entropy-warn 中 automation 9 + lark 7 = 16 次确定性误报，占 1/3）
-    const entropyExempt = /^(dsh-automation|automation|lark)/.test(sid)
+    // 2026-08-23 豁免 automation/lark（固定流程天然单工具）；2026-08-25 扩展 subagent——
+    // 专注型批量任务（连续 read 一本书/批量文件）工具单一化是正常行为，非死循环/偏执
+    // subagent 会话 sid 为 UUID 格式（如 e28b9019-0487-…），与正常 session 的 session-xxx 前缀区分
+    const entropyExempt = /^(dsh-automation|automation|lark)/.test(sid) ||
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid)
     if (!entropyExempt && s.recentCalls.length >= 8 && s.entropy < cfg.control.entropyWarnAt && !s.entropyWarned) {
       s.entropyWarned = true
       logState({ ts: now, event: 'entropy-warn', sid, entropy: s.entropy, window: s.recentCalls.length })
@@ -469,6 +518,9 @@ export function apply(ctx, config = {}) {
     }
 
     // B5 耗时起点 + 记录预测 y_pred（= 滤波失败率 pHat）并放行
+    // v4.3 异步配对：把起点快照挂在 exec 对象上，result 按同一 exec 引用配对，
+    // 避免异步 job/subagent 的 result 迟到导致耗时/预测错位（对照第 11 章时滞）
+    exec.__cyber = { startedAt: now, yPred: s.pHat }
     s.lastStartTs = now
     s.lastStartTool = toolName
     s.yPred = s.pHat
@@ -494,10 +546,13 @@ export function apply(ctx, config = {}) {
     s.lastDelta = delta
     s.resultCount += 1
 
-    // B5 工具耗时
+    // B5 工具耗时（v4.3 异步配对：优先用 exec.__cyber 起点，fallback lastStartTs）
+    const meta = exec?.__cyber
+    const yPred = meta?.yPred ?? s.yPred
     let dtMs = null
-    if (s.lastStartTs) {
-      dtMs = Date.now() - s.lastStartTs
+    const startedAt = meta?.startedAt ?? s.lastStartTs
+    if (startedAt) {
+      dtMs = Date.now() - startedAt
       const d = s.toolDurations.get(tool) ?? { totalMs: 0, count: 0 }
       d.totalMs += dtMs
       d.count += 1
@@ -514,7 +569,7 @@ export function apply(ctx, config = {}) {
       tool,
       isError,
       delta,
-      y_pred: s.yPred,
+      y_pred: yPred,
       pHat: s.pHat,
     }
     // 方案 B（2026-08-19）：失败归因观测——errorType/errMsg 供周检第④项做根因分布
@@ -523,6 +578,10 @@ export function apply(ctx, config = {}) {
       if (cls) {
         entry.errorType = cls.errorType
         if (cls.errMsg) entry.errMsg = cls.errMsg
+        // v4.3 兜底：写/编辑前未 read 导致的沙箱拒绝 → 提示先 read（可消除的失败，对照第 5 章前馈意图）
+        if (cls.errorType === 'FS_NOT_OBSERVED') {
+          queueWarn(s, '[能控性兜底] 写/编辑文件被沙箱拒绝（FS_NOT_OBSERVED：目标文件本会话尚未 read）。请先用 read 工具读取该文件内容，再执行写/编辑。')
+        }
       }
     }
     if (dtMs != null) entry.dtMs = dtMs
@@ -565,7 +624,7 @@ export function apply(ctx, config = {}) {
           const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
           const msg = createUserMessage({
             content: [{ type: 'text', text: warns.join('\n') }],
-            source: { kind: 'plugin', plugin: 'dsh-cybernetics' },
+            source: { kind: 'plugin:dsh-cybernetics' },
           })
           return { ...decision, messages: [...decision.messages, msg] }
         } catch {
@@ -795,7 +854,7 @@ export function apply(ctx, config = {}) {
   // 只写 sandbox/mode 事件、不碰 approval/policy——避开「Full access 预设绑定 approval=never」的坑
   ctx.tools.register(defineTool({
     name: 'cybernetics_sandbox_mode',
-    description: '切换当前会话的 DSH 文件沙箱模式（per-session 生效，重启后保留）：workspace-write=默认（可写工作区+临时区，工作区外写/删需批准）；danger-full-access=全部文件操作免沙箱拦截（任意目录可写，删除等不可逆命令仍由前馈批准门拦截）；read-only=所有变更被拒。模式不影响读取（读取始终无限制）。切换由用户明确确认后执行',
+    description: '切换当前会话的 DSH 文件沙箱模式（per-session 生效，重启后保留）：workspace-write=默认（可写工作区+临时区，工作区外写/删需批准）；danger-full-access=全部文件操作免沙箱拦截（任意目录可写，删除等不可逆命令仍由 dsh-approval-gate 批准门拦截）；read-only=所有变更被拒。模式不影响读取（读取始终无限制）。切换由用户明确确认后执行',
     parameters: {
       mode: { type: 'string', required: true, description: '目标沙箱模式：read-only / workspace-write / danger-full-access' },
     },
@@ -811,7 +870,7 @@ export function apply(ctx, config = {}) {
       if (!session) throw new Error('no session available to switch sandbox mode')
       session.append('sandbox/mode', { mode })
       const tip = mode === 'danger-full-access'
-        ? '写全放开：任意目录可写（含 Obsidian 等工作区外）。删除/不可逆命令（rm/mv/shred/git push 等）仍走前馈批准门，需用户批准。'
+        ? '写全放开：任意目录可写（含 Obsidian 等工作区外）。删除/不可逆命令（rm/mv/shred/git push 等）仍由 dsh-approval-gate 批准门拦截，需用户批准。'
         : mode === 'workspace-write'
           ? '默认模式：可写工作区 + 临时区；工作区外写/删触发沙箱拒绝，可升级请求批准。'
           : '只读：所有文件变更被拒，读取不受影响。'

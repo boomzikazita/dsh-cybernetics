@@ -1,8 +1,6 @@
 node_modules/
-__pycache__/
-*.pyc
-*.bak
-*.bak-*
-*.tmp
-usage.json
-.DS_Store
+.env
+.env.*
+*.pem
+*.key
+credentials*

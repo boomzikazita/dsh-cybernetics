@@ -1,5 +1,7 @@
 # dsh-cybernetics bundle patch — 控制论内核 v4 运行时
 # 挂载：把 dsh-cybernetics 加入 profile 的 dsh.profile.bundles
+# v0.2.0（2026-10-14）：irreversible-write 拦截规则收敛到 dsh-approval-gate，
+# 本表只保留 retry/timeout 类「放行+警告」规则
 - insert:
     - id: cybernetics
       name: 'dsh-cybernetics'
@@ -10,10 +12,6 @@
             tools: ['bash']
             pattern: '\\b(git|npm|curl|wget|pnpm)\\b'
             action: { strategy: 'retry+timeout', retry: 2, timeout: 30000 }
-          - id: 'irreversible-write'
-            tools: ['bash']
-            pattern: '\\b(rm|mv|rmdir|shred)\\b|git (push|reset --hard|clean)'
-            action: { strategy: 'dry-run+confirm', dryRun: true, confirm: true }
         stability:
           maxToolCallsPerTurn: 5
         modes:
