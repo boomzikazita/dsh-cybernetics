@@ -1,10 +1,10 @@
 {
   "name": "dsh-cybernetics",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "index.js",
-  "description": "控制论内核 v4 运行时：EMA 反馈回路/发散振荡检测/能控性自检/稳定阀。v0.2.0：适配 dsh 0.2（Config 不导出、pre-step 注入 v4 source 形态）；不可逆拦截规则收敛至 dsh-approval-gate，feedforward 仅保留 retry/timeout 放行+警告。",
+  "description": "控制论内核 v4 运行时：EMA 反馈回路/发散振荡检测/能控性自检/稳定阀。v0.2.0：适配 dsh 0.2（Config 不导出、pre-step 注入 v4 source 形态）；不可逆拦截规则收敛至宿主审批门，feedforward 仅保留 retry/timeout 放行+警告。v0.2.1：警告注入链路修复（dsh-llm 不可解析时等价兜底 + 失败回队）、稳定阀改按 turn 计数且 patch 基线生效、前馈正则修正（YAML 双反斜杠致从未命中）、沙箱提权走宿主审批门（{kind:'ask'}）、agent/disposed 改 emit 签名、能控性工具集取 agent scope ∪ 全局视图。",
   "dependencies": {},
   "peerDependencies": {
     "@deepseek-ai/dsh": "*",

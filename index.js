@@ -1,6 +1,16 @@
 /**
  * dsh-cybernetics — 控制论内核 v4 运行时（DeepSeek Harness 插件）
  *
+ * v0.2.1（2026-10-15，修 6 处运行期缺陷）：
+ *   1. 警告注入恒失效：@deepseek-ai/dsh-llm 裸导入在插件真实目录不可解析，且失败即整批丢弃
+ *      → 等价兜底消息工厂 + 注入失败回队 + 留痕（原日志 9/9 dropped-warn）
+ *   2. 稳定阀按 step 清零（`maxToolCallsPerTurn` 永不触发，22h 0 命中）→ 按 turn 边界清零；
+ *      且 patch 基线原为死配置，现 patch 值优先（5→25）
+ *   3. 前馈正则被 YAML 单引号写成双反斜杠（`test('git status')===false`，从未命中）→ 单反斜杠
+ *   4. 沙箱提权无审批门（一次调用即可自我授予全盘写权）→ tools/pre-execute 返回 {kind:'ask'}
+ *   5. agent/disposed 误用 waterfall 签名（emit 事件无 next，每次销毁抛错）→ emit 形态
+ *   6. cybernetics_check 工具集取 agent scope ∪ 全局视图（原把可用的 grep 报成 missing）
+ *
  * v0.2.0（2026-10-14，dsh 0.2 适配 + 规则收敛）：
  *   适配 1 删除 `export const Config = null`（Config 不导出才安全，null 会崩设置页）
  *   适配 2 feedforward 规则表删除不可逆写入类（irreversible-write 等）拦截规则——
@@ -53,6 +63,7 @@
  *   能控性    目标 + 所需工具 vs 当前可用工具 自检
  */
 import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { resolve, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -104,6 +115,33 @@ function normalizeModes(modes) {
   return Object.keys(out).length ? out : { ...DEFAULT_MODES }
 }
 
+// ---------- 注入消息工厂（v0.2.1） ----------
+// 优先宿主 @deepseek-ai/dsh-llm 的 createUserMessage；该裸导入在插件真实目录下可能解析不到
+// （本机实测 ERR_MODULE_NOT_FOUND：/home/boom/dsh-plugins/node_modules/@deepseek-ai/ 只有
+// dsh-tools），原实现把 import 放在 try 里静默吞掉 ⇒ 全部警告注入恒失效（9/9 dropped-warn）。
+// 解析失败时按宿主 createMessage 的等价形态兜底（role/content/source/id + 冻结）。
+let _createUserMessage = null // null=未探测 / function=宿主工厂 / false=不可用
+let _injectFactoryWarned = false
+async function makeInjectedUserMessage({ text, kind }) {
+  const content = [{ type: 'text', text }]
+  if (_createUserMessage === null) {
+    try {
+      const mod = await import('@deepseek-ai/dsh-llm')
+      _createUserMessage = typeof mod?.createUserMessage === 'function' ? mod.createUserMessage : false
+    } catch {
+      _createUserMessage = false
+    }
+  }
+  if (typeof _createUserMessage === 'function') {
+    return _createUserMessage({ content, source: { kind } })
+  }
+  if (!_injectFactoryWarned) {
+    _injectFactoryWarned = true
+    console.warn('[dsh-cybernetics] @deepseek-ai/dsh-llm 不可解析，注入消息走等价兜底形态（建议补 node_modules/@deepseek-ai/dsh-llm 软链）')
+  }
+  return Object.freeze({ id: randomUUID(), role: 'user', content, source: { kind } })
+}
+
 // ---------- 会话状态工厂（B7：每会话一份控制状态） ----------
 function createSessionState(sid, seed = {}) {
   return {
@@ -137,6 +175,8 @@ function createSessionState(sid, seed = {}) {
     observationRate: 'n/a',    // 观测完整率（P2 能观性自检，A2 钳制 ≤1）
     pendingWarns: [],          // 待注入警告队列（agent/pre-step 消费）
     warnedOverLimit: false,
+    currentTurn: null,         // v0.2.1：稳定阀按 turn 边界清零（原按 step 清零永不触发）
+    sandboxMode: null,         // v0.2.1：本插件切过的沙箱档位（提权判定用；null=未知）
     recentCalls: [],           // 最近调用 { tool, hash, ts }（冗余/熵窗口）
     toolDurations: new Map(),  // B5 工具耗时 { tool → { totalMs, count } }
     sessionObserved: new Set(), // 本次会话实际调用过的工具（能观性分层依据）
@@ -462,22 +502,40 @@ export function apply(ctx, config = {}) {
       s.entropyWarned = false // 恢复条件（滞环）
     }
 
+    // 沙箱提权门（v0.2.1 新增）
+    // 原实现只写 sandbox/mode、无任何确认 ⇒ 一次工具调用即可自我授予 danger-full-access
+    // （任意目录写），唯一约束是工具描述里那句"需用户确认"（提示词级，不可强制）。
+    // 宿主的正规路径是逐操作的 sandbox_permissions 升级（要批准往返）。此处把提权挂进
+    // 同一道宿主审批门：返回 {kind:'ask'} → ctx.approval.request → allowed-once 才执行。
+    const SANDBOX_RANK = { 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 }
+    if (toolName === 'cybernetics_sandbox_mode') {
+      const target = String(exec?.arguments?.mode ?? exec?.args?.mode ?? '')
+      const rank = SANDBOX_RANK[target]
+      const isEscalation = rank === 2 || (rank === 1 && s.sandboxMode === 'read-only')
+      if (isEscalation) {
+        logState({ ts: now, event: 'sandbox-mode-ask', sid, target })
+        return {
+          kind: 'ask',
+          reason: `[沙箱提权] 请求把本会话文件沙箱切到 ${target}（任意目录可写）。请批准后再执行。`,
+          displayReason: {
+            en: `Escalate this session's file sandbox to ${target} (unrestricted writes)?`,
+            zh: `确认把本会话文件沙箱提权到 ${target}（任意目录可写）？`,
+          },
+        }
+      }
+    }
+
     // 前馈：高风险/不可逆操作 → 批准门（dry-run+confirm）或放行+警告（retry+timeout）
     const hit = matchFeedforward(exec)
     if (hit) {
       state.feedforwardHits += 1
       const isAsk = hit.action.strategy === 'dry-run+confirm' // 不可逆操作：强制批准门
       if (!isAsk) state.feedforwardBlocks += 1
-      logState({
-        ts: now,
-        event: 'pre-execute',
-        sid,
-        tool: toolName,
-        feedforward: hit.id,
-        strategy: hit.action.strategy,
-        ask: isAsk,
-        blocked: !isAsk,
-      })
+      if (isAsk) {
+        // ask 分支会提前 return（走审批），单独留痕；放行分支则由下方统一的 pre-execute
+        // 一条记录带 feedforward 字段，避免同一调用写两条 pre-execute。
+        logState({ ts: now, event: 'feedforward-ask', sid, tool: toolName, feedforward: hit.id, strategy: hit.action.strategy })
+      }
       if (isAsk) {
         // 批准门：返回 {kind:'ask'}，工具中心走 ctx.approval.request 弹批准，
         // allowed-once 放行执行；rejected/cancelled/unavailable 一律不执行（fail closed）
@@ -489,12 +547,17 @@ export function apply(ctx, config = {}) {
       // retry+timeout（网络不稳定类）规则：不得硬拦截——原实现 kind:'block' 没有任何确认/重试
       // 放行路径，会把 git/npm/curl/wget/pnpm 命令永久阻断。修正：记录命中、注入警告、放行执行。
       s.pendingWarns.push(`[前馈] 规则「${hit.id}」命中 ${toolName}（${hit.action.strategy}）：已放行；网络类命令若失败请带超时重试`)
-      return next()
+      // v0.2.1：这里不再 `return next()`——放行后继续走稳定阀/耗时起点/exec.__cyber 配对，
+      // 否则该次调用缺 exec.__cyber，result 迟到时会与下一次调用错配（B5 配对失效）。
     }
 
     // 稳定阀（本轮窗口，会话级）：超限降级为警告，交互/观测工具豁免
     const modeNow = currentMode(s)
-    const maxPerTurn = MODE_LIMITS[modeNow] ?? cfg.stability.maxToolCallsPerTurn
+    // v0.2.1：配置优先级修正——原 `MODE_LIMITS[modeNow] ?? cfg.stability.maxToolCallsPerTurn`
+    // 中 MODE_LIMITS 覆盖三档全部取值 ⇒ patch 里的 maxToolCallsPerTurn 是**死配置**。
+    // 现改为：patch 显式配置优先，未配时回落到档位表（fast 5 / deep 4 / conservative 3）。
+    // 注：窗口已修正为按 turn 计数，故 patch 侧基线调成 25（见 cordis.patch.yml 注释）。
+    const maxPerTurn = cfg.stability.maxToolCallsPerTurn ?? MODE_LIMITS[modeNow] ?? 5
     const overLimit = s.toolCallsInTurn > maxPerTurn
     const exempt = toolName === 'ask_user_question' || toolName === 'cybernetics_snap' || toolName === 'cybernetics_status' || toolName === 'cybernetics_check' || toolName === 'cybernetics_sandbox_mode'
     if (overLimit && !exempt) {
@@ -532,6 +595,7 @@ export function apply(ctx, config = {}) {
       tool: toolName,
       y_pred: s.yPred,
       blocked: false,
+      ...(hit ? { feedforward: hit.id, strategy: hit.action.strategy } : {}),
     })
     return next()
   })
@@ -615,21 +679,29 @@ export function apply(ctx, config = {}) {
         if (!decision || decision.kind === 'reject') return decision
         const sid = payload?.agent?.session?.id ?? 'global'
         const s = getSessionState(sid)
-        s.toolCallsInTurn = 0 // 本轮计数重置（每轮请求边界）
+        // v0.2.1：稳定阀窗口修正——原实现每次 pre-step（**每个 step 都触发**）无条件清零，
+        // 计数只能覆盖单次模型回复内的并行调用（通常 ≤5），`maxToolCallsPerTurn: 5`
+        // 永远够不到（22h/516 次调用 stability-warn 0 次）。改为**按 turn 边界**清零。
+        const turn = payload?.turn
+        if (turn === undefined || s.currentTurn !== turn) {
+          if (turn !== undefined) s.currentTurn = turn
+          s.toolCallsInTurn = 0
+          s.warnedOverLimit = false
+        }
         s.failedHintSent = false // 连续失败兜底提示每轮允许重新触发
         if (s.pendingWarns.length === 0) return decision
         const warns = s.pendingWarns
         s.pendingWarns = []
         try {
-          const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
-          const msg = createUserMessage({
-            content: [{ type: 'text', text: warns.join('\n') }],
-            source: { kind: 'plugin:dsh-cybernetics' },
+          const msg = await makeInjectedUserMessage({
+            text: warns.join('\n'),
+            kind: 'plugin:dsh-cybernetics',
           })
           return { ...decision, messages: [...decision.messages, msg] }
-        } catch {
-          // C11：注入失败留痕，避免警告静默丢失
-          logState({ ts: Date.now(), event: 'dropped-warn', sid, count: warns.length })
+        } catch (e) {
+          // C11：注入失败留痕 + v0.2.1 整批回队（原实现只在日志留痕，警告仍被丢弃且无重试）
+          s.pendingWarns.unshift(...warns)
+          logState({ ts: Date.now(), event: 'dropped-warn', sid, count: warns.length, error: String(e?.message || e) })
           return decision
         }
       })
@@ -637,9 +709,12 @@ export function apply(ctx, config = {}) {
   }
 
   // ---------- 3c. agent/disposed：会话汇总（B6，供周检 automation / 复盘消费） ----------
+  // v0.2.1：`agent/disposed` 是 @mode emit（不是 waterfall），监听器只收到 `{agent}`，
+  // 原实现签名 `({agent}, next) => { …; return next() }` 每次销毁都抛 TypeError
+  // （被宿主吞掉记 warn）。emit 形态不调 next。
   if (typeof ctx.on === 'function' && ctx.agents) {
     try {
-      ctx.on('agent/disposed', async ({ agent }, next) => {
+      ctx.on('agent/disposed', ({ agent }) => {
         const sid = agent?.session?.id ?? 'unknown'
         const s = state.bySession.get(sid)
         if (s) {
@@ -661,7 +736,6 @@ export function apply(ctx, config = {}) {
           })
           state.bySession.delete(sid)
         }
-        return next()
       })
     } catch { /* disposed 不可用则跳过 */ }
   }
@@ -814,15 +888,19 @@ export function apply(ctx, config = {}) {
       const goal = input?.goal || '（未提供目标）'
       const required = Array.isArray(input?.requiredTools) ? input.requiredTools : []
       const s = sessionOf(exec)
-      // 可用工具集：插件自身注册工具（确定性）+ 被动观测到的宿主工具
-      // （sandbox 的 ctx.tools.schemas() 按插件 scope 过滤，宿主工具不可见，
-      //   故以观测法收集；对照 4.10 能观性——观测越充分，能控性判定越可信）
-      let pluginTools = []
-      try {
-        if (typeof ctx.tools?.schemas === 'function') pluginTools = ctx.tools.schemas().map((t) => t.name).filter(Boolean)
-      } catch {
-        pluginTools = []
+      // 可用工具集（v0.2.1 修正）：`ctx.tools.schemas(scope)` 的 scope 语义是"查看作用域"，
+      // 省略 scope 时在插件上下文里只拿到很窄的一层（实测漏掉 grep/glob 等宿主工具，
+      // 于是 cybernetics_check 把明明可用的 grep 报成 missing → 误判 not-controllable）。
+      // 改为：agent scope 视图 ∪ 全局视图 ∪ 被动观测 ∪ 插件自身注册，取并集（保守：宁可多认）。
+      const collect = (scope) => {
+        try {
+          const list = ctx.tools?.schemas?.(scope)
+          return Array.isArray(list) ? list.map((t) => t.name).filter(Boolean) : []
+        } catch {
+          return []
+        }
       }
+      const pluginTools = [...new Set([...collect(exec?.agent), ...collect(undefined)])]
       // 语义分层（v4.1）：未观测 ≠ 缺失
       //   missing     确定性缺失（插件/记忆/观测均无）→ not-controllable（真警告）
       //   unobserved  已知可用但本次会话尚未实测（依据观测记忆）→ 提示 caution，不判不可控
@@ -851,10 +929,13 @@ export function apply(ctx, config = {}) {
 
   // ---------- 6.5 工具：cybernetics_sandbox_mode（切换会话沙箱模式） ----------
   // 零依赖实现 dsh-sandbox-policy 的 setSandboxMode（等价：session.append('sandbox/mode', {mode})），
-  // 只写 sandbox/mode 事件、不碰 approval/policy——避开「Full access 预设绑定 approval=never」的坑
+  // 只写 sandbox/mode 事件、不碰 approval/policy——避开「Full access 预设绑定 approval=never」的坑。
+  // v0.2.1：**提权改为走宿主审批门**（tools/pre-execute 对该工具返回 {kind:'ask'}）——
+  // 原实现无任何确认，一次调用即可自我授予全盘写权；描述里"由 dsh-approval-gate 拦截"是
+  // 不存在的组件（本机无此包，仅 ~/.dsh.sealed 有 hermes 时代封存副本），已删该保证。
   ctx.tools.register(defineTool({
     name: 'cybernetics_sandbox_mode',
-    description: '切换当前会话的 DSH 文件沙箱模式（per-session 生效，重启后保留）：workspace-write=默认（可写工作区+临时区，工作区外写/删需批准）；danger-full-access=全部文件操作免沙箱拦截（任意目录可写，删除等不可逆命令仍由 dsh-approval-gate 批准门拦截）；read-only=所有变更被拒。模式不影响读取（读取始终无限制）。切换由用户明确确认后执行',
+    description: '切换当前会话的 DSH 文件沙箱模式（per-session 生效，重启后保留）：workspace-write=默认（可写工作区+临时区，工作区外写/删需批准）；danger-full-access=全部文件操作免沙箱拦截（任意目录可写，读取不受限）；read-only=所有变更被拒。**提权（danger-full-access，或从 read-only 升到 workspace-write）会触发宿主审批门，需你批准后才生效；降级立即生效。**',
     parameters: {
       mode: { type: 'string', required: true, description: '目标沙箱模式：read-only / workspace-write / danger-full-access' },
     },
@@ -869,8 +950,10 @@ export function apply(ctx, config = {}) {
       const session = exec?.agent?.session
       if (!session) throw new Error('no session available to switch sandbox mode')
       session.append('sandbox/mode', { mode })
+      // 记录档位（提权判定用；本插件重启后由 sandbox/mode 事件回放决定实际模式）
+      try { sessionOf(exec).sandboxMode = mode } catch { /* 状态不可用不影响切换 */ }
       const tip = mode === 'danger-full-access'
-        ? '写全放开：任意目录可写（含 Obsidian 等工作区外）。删除/不可逆命令（rm/mv/shred/git push 等）仍由 dsh-approval-gate 批准门拦截，需用户批准。'
+        ? '写全放开：任意目录可写（含 Obsidian 等工作区外）。注意：本机并无 dsh-approval-gate 组件，rm/mv/shred 等破坏性命令**不**会被该门拦截；本插件只对"提权到这个档位"这一步做了审批。'
         : mode === 'workspace-write'
           ? '默认模式：可写工作区 + 临时区；工作区外写/删触发沙箱拒绝，可升级请求批准。'
           : '只读：所有文件变更被拒，读取不受影响。'
@@ -888,7 +971,9 @@ export function apply(ctx, config = {}) {
     version: VERSION,
     mode: state.autoModeSeed,
     feedforwardRules: cfg.feedforward.length,
-    maxToolCallsPerTurn: MODE_LIMITS[state.autoModeSeed],
+    // v0.2.1：打印**生效值**（patch 基线优先，回落档位表）——原来打印 MODE_LIMITS，
+    // 与稳定阀实际使用值不一致（日志显示 5，实际用 patch 的 25）。
+    maxToolCallsPerTurn: cfg.stability.maxToolCallsPerTurn ?? MODE_LIMITS[state.autoModeSeed],
     control: cfg.control,
     recovered: recovered ? state.recovered : null,
   })

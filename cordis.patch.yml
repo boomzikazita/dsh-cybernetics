@@ -1,7 +1,14 @@
 # dsh-cybernetics bundle patch — 控制论内核 v4 运行时
 # 挂载：把 dsh-cybernetics 加入 profile 的 dsh.profile.bundles
-# v0.2.0（2026-10-14）：irreversible-write 拦截规则收敛到 dsh-approval-gate，
-# 本表只保留 retry/timeout 类「放行+警告」规则
+# v0.2.1（2026-10-15）：
+#   1. 前馈正则修正：YAML 单引号不转义 ⇒ '\\b(...)\\b' 解析成**双反斜杠**，
+#      new RegExp(...).test('git status') === false，规则从未命中（实据：516 次
+#      pre-execute 带 feedforward 字段 0 条）。改为单反斜杠 '\b(...)\b'。
+#   2. 稳定阀基线：窗口已由「每 step 清零」修正为「按 turn 清零」，故基线取 25
+#      （原 5 在按 step 口径下永不触发，按 turn 口径下会每轮误报）。
+#   注：v0.2.0 起的规则收敛说明——不可逆拦截已不在本插件，「批不批」由宿主审批门
+#   （tools/pre-execute 返回 {kind:'ask'} → ctx.approval.request）承担；本机并无名为
+#   dsh-approval-gate 的组件（仅 ~/.dsh.sealed 存有 hermes 时代封存副本）。
 - insert:
     - id: cybernetics
       name: 'dsh-cybernetics'
@@ -10,10 +17,10 @@
         feedforward:
           - id: 'network-unstable'
             tools: ['bash']
-            pattern: '\\b(git|npm|curl|wget|pnpm)\\b'
+            pattern: '\b(git|npm|curl|wget|pnpm)\b'
             action: { strategy: 'retry+timeout', retry: 2, timeout: 30000 }
         stability:
-          maxToolCallsPerTurn: 5
+          maxToolCallsPerTurn: 25
         modes:
           fast: { label: '快速响应', zeta: 0.3 }
           deep: { label: '深度分析', zeta: 0.7 }
