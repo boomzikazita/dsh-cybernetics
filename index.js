@@ -384,12 +384,19 @@ export function apply(ctx, config = {}) {
     const SKILL_DISCOVERY_TOOLS = new Set(['skill_search', 'skill_mece_check', 'skill', 'list_agents'])
     if (isError && !SKILL_DISCOVERY_TOOLS.has(tool) && s.divergenceStreak >= 2 && !s.failedHintSent) {
       s.failedHintSent = true
-      const lastArgs = execArgsText(exec) || ''
-      const ctxHint = lastArgs ? `（最近失败调用：\`${tool}\` ${lastArgs.slice(0, 120)}）` : ''
+      // v0.2.2（2026-10-27 实证，k3 会话 52 连跪）：①不回显失败调用的参数原文——
+      // 陷入模式锁定的模型会照抄上下文里的调用，回显 = 每轮再示范一遍错误写法；
+      // ②streak≥5 不再推 skill_search（实测方向跑偏：让人为 bash 查 OCR 技能），
+      // 改为命令式熔断：停手、换路、问用户。
       logState({ ts: Date.now(), event: 'skill-search-fallback', sid, tool, streak: s.divergenceStreak })
-      queueWarn(s, `[能控性兜底] 连续 ${s.divergenceStreak} 次工具调用失败，疑似在用底层工具硬解、而非检索既有能力。` +
-        `请立即调用 \`skill_search\` 工具检索「${tool}」相关关键词，确认是否有对口技能/现成脚本（如 OCR、读图、转换类），` +
-        `再决定下一步；禁止在未检索技能库的情况下判定任务不可行。${ctxHint}`)
+      if (s.divergenceStreak >= 5) {
+        queueWarn(s, `[能控性熔断] 已连续 ${s.divergenceStreak} 次失败。立即停止重复上一次调用——同样的参数不会再产出不同结果。` +
+          `请改用不同方法/参数，或直接用文字向用户说明卡点并请求指示。禁止原样重试。`)
+      } else {
+        queueWarn(s, `[能控性兜底] 连续 ${s.divergenceStreak} 次工具调用失败（工具：\`${tool}\`），疑似在用底层工具硬解、而非检索既有能力。` +
+          `请调用 \`skill_search\` 检索「${tool}」相关关键词，确认是否有对口技能/现成脚本（如 OCR、读图、转换类），` +
+          `再决定下一步；禁止在未检索技能库的情况下判定任务不可行。`)
+      }
     }
 
     logState(entry)
@@ -412,8 +419,10 @@ export function apply(ctx, config = {}) {
           if (turn !== undefined) s.currentTurn = turn
           s.toolCallsInTurn = 0
           s.warnedOverLimit = false
+          // v0.2.2：failedHintSent 移入 turn 边界块——原先在块外每 step 都重置，
+          // 导致同一 turn 内「能控性兜底」按 step 重复注入（52 连跪事件单 turn 注入 51 次）
+          s.failedHintSent = false
         }
-        s.failedHintSent = false // 连续失败兜底提示每轮允许重新触发
         if (s.pendingWarns.length === 0) return decision
         const warns = s.pendingWarns
         s.pendingWarns = []
